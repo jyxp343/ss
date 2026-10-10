@@ -1,0 +1,88 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+      - name: 2. Create Admin Account
+        env:
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ADMIN_PASSWORD)) {
+            throw "ADMIN_PASSWORD secret is missing"
+          }
+
+          $Password = ConvertTo-SecureString $env:ADMIN_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name 'NvdAdmin' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'NvdAdmin' -Password $Password
+          } else {
+            New-LocalUser -Name 'NvdAdmin' -Password $Password -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember -Group 'Administrators' -Member 'NvdAdmin' -ErrorAction SilentlyContinue
+
+      - name: 3. Install Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing"
+          }
+
+          $Installer = Join-Path $env:TEMP 'tailscale.msi'
+
+          Invoke-WebRequest 
+            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' 
+            -OutFile $Installer
+
+          $Process = Start-Process msiexec.exe 
+            -ArgumentList @('/i', ""$Installer"", '/quiet', '/norestart') 
+            -Wait -PassThru
+
+          if ($Process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed with exit code $($Process.ExitCode)"
+          }
+
+          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $Tailscale)) {
+            throw 'Tailscale executable was not found after installation'
+          }
+
+          & $Tailscale up "--authkey=$env:TAILSCALE_AUTHKEY" --hostname=github-runner
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Tailscale connection failed'
+          }
+
+          Start-Sleep -Seconds 5
+
+          $TsIP = & $Tailscale ip -4
+
+          if ($LASTEXITCODE -ne 0 -or -not $TsIP) {
+            throw 'Could not retrieve Tailscale IP'
+          }
+
+          Write-Host "Tailscale IP: $TsIP"
+          Write-Host 'Tailscale setup completed'
+
+      - name: 4. Keep Job Alive
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 2880; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/2880] Job running..."
+          }
